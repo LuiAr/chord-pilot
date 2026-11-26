@@ -46,7 +46,7 @@ export type View = {
 
 function rightLabel(v: View): { text: string; color: string } {
   if (v.countIn > 0) return { text: `in ${v.countIn}`, color: WHITE };
-  if (v.flashKey) return { text: `key ${keyName(v.key, v.prog.mode)}`, color: WHITE };
+  if (v.flashKey) return { text: `key ${keyName(v.key, v.prog.mode)}${v.prog.mode === "minor" ? "m" : ""}`, color: WHITE };
   return { text: symbol(v.next), color: v.nextInNewKey ? WHITE : DIM };
 }
 
@@ -64,12 +64,14 @@ function beatBar(v: View, color: string) {
   for (let i = 0; i < MAX_BEATS; i++) {
     const shown = v.playing && i < segments;
     const lit = v.countIn > 0 ? i <= COUNT_IN - v.countIn : i <= v.beat;
+    // Segments not in use stay on screen, transparent.
+    const inUse = i < segments;
     els.push({
       id: `f_beat${i}`,
       type: "rectangle" as const,
-      x: i * width,
+      x: inUse ? i * width : 0,
       y: 15,
-      width: width - 1,
+      width: inUse ? width - 1 : 1,
       height: 1,
       fill: "solid" as const,
       fill_colors: [!shown ? NONE : lit ? (v.countIn > 0 ? WHITE : color) : FAINT],

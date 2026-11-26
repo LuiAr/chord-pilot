@@ -3,7 +3,7 @@
   "id": "app.luiar.chord-pilot",
   "name": "Chord Pilot",
   "version": "0.1.0",
-  "api_version": "27.12.0",
+  "api_version": "27.14.0",
   "description": "Practice chord progressions through all 12 keys",
   "author": "LuiAr"
 }

@@ -1,7 +1,9 @@
 /**
  * A beat clock. Each beat is scheduled at start + n x period rather than chained
  * from the previous timer, so late timers do not add up into drift. If the app
- * was held up for longer than a beat, the missed beats are skipped, not replayed.
+ * was held up for longer than a beat, the missed beats are skipped, not replayed:
+ * the callback gets the beat that is due now, which may jump ahead by more than one.
+ * A wait never exceeds one period, so a wall clock set backwards cannot stall it.
  */
 export type BeatClock = {
   /** Starts counting from beat 0 now. Restarts if already running. */
@@ -17,16 +19,16 @@ export function beatClock(periodMs: () => number, onBeat: (beat: number) => void
   let period = 0;
 
   const schedule = () => {
-    timer = setTimeout(tick, Math.max(0, t0 + beat * period - Date.now()));
+    const wait = t0 + beat * period - Date.now();
+    timer = setTimeout(tick, Math.min(period, Math.max(0, wait)));
   };
 
   const tick = () => {
     timer = undefined;
-    const current = beat;
-    const due = Math.floor((Date.now() - t0) / period);
-    beat = Math.max(current + 1, due + 1);
+    const due = Math.max(beat, Math.floor((Date.now() - t0) / period));
+    beat = due + 1;
     schedule();
-    onBeat(current);
+    onBeat(due);
   };
 
   const stop = () => {

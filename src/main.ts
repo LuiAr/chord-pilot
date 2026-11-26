@@ -18,12 +18,17 @@ const APP = manifest.id;
 const STORE_KEY = "state";
 const SAVE_DELAY_MS = 4000;
 const KEY_FLASH_MS = 1500;
+/** Upper bound on chord changes caught up in one beat, should the clock jump far ahead. */
+const MAX_CATCH_UP = 48;
 
 type AfterRound = "fourth" | "semitone" | "stay";
 const KEY_SHIFT: Record<AfterRound, number> = { fourth: 5, semitone: 1, stay: 0 };
 
 type Config = { tempo: number; beats: number; afterRound: AfterRound };
 const DEFAULTS: Config = { tempo: 80, beats: 4, afterRound: "fourth" };
+
+const isAfterRound = (value: string): value is AfterRound =>
+  Object.prototype.hasOwnProperty.call(KEY_SHIFT, value);
 
 function readConfig(values: Record<string, unknown> | null): Config {
   if (!values) return DEFAULTS;
@@ -33,7 +38,7 @@ function readConfig(values: Record<string, unknown> | null): Config {
   return {
     tempo: tempo >= 40 && tempo <= 200 ? tempo : DEFAULTS.tempo,
     beats: beats === 2 || beats === 4 || beats === 8 ? beats : DEFAULTS.beats,
-    afterRound: after in KEY_SHIFT ? (after as AfterRound) : DEFAULTS.afterRound,
+    afterRound: isAfterRound(after) ? after : DEFAULTS.afterRound,
   };
 }
 
@@ -44,7 +49,9 @@ function loadPosition(): { key: number; prog: number } {
       const saved = JSON.parse(raw) as { key?: unknown; prog?: unknown };
       const key = Number(saved.key);
       const prog = Number(saved.prog);
-      if (key >= 0 && key < 12 && prog >= 0 && prog < PROGRESSIONS.length) return { key, prog };
+      const valid =
+        Number.isInteger(key) && key >= 0 && key < 12 && Number.isInteger(prog) && prog >= 0 && prog < PROGRESSIONS.length;
+      if (valid) return { key, prog };
     }
   } catch {
     // A missing or damaged store starts from C and the first progression.
@@ -59,22 +66,30 @@ function main(): void {
   let prog = start.prog;
   let step = 0;
 
+  /** Controls wait for the settings, so that play never starts at the wrong tempo. */
+  let ready = false;
   let playing = false;
   /** Beats of count-in before the chords: a bar after Start, none after a manual step. */
   let countInBeats = 0;
   let countIn = 0;
   let beat = 0;
+  /** Chords played since the beat started, to count the changes when beats are skipped. */
+  let chordsPlayed = 0;
   let flashKey = false;
 
   let stopped = false;
   let drawing = false;
   let dirty = false;
   let backDirty = true;
+  /** The key or progression changed since the last save. */
+  let unsaved = false;
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
   const report = (err: unknown) =>
     console.error(`${APP}: ${String((err as { message?: unknown })?.message ?? err)}`);
+
+  const beatMs = () => 60000 / config.tempo;
 
   /** Where Start or the beat goes after the current chord. */
   const nextPosition = () => {
@@ -114,9 +129,16 @@ function main(): void {
       dirty = true;
       return;
     }
+    let elements;
+    const withBack = backDirty;
+    try {
+      const v = view();
+      elements = withBack ? [...frontElements(v), ...backElements(v)] : frontElements(v);
+    } catch (err) {
+      report(err);
+      return;
+    }
     drawing = true;
-    const v = view();
-    const elements = backDirty ? [...frontElements(v), ...backElements(v)] : frontElements(v);
     backDirty = false;
     const done = () => {
       drawing = false;
@@ -127,11 +149,16 @@ function main(): void {
     };
     device.DisplayDraw({ application_name: APP, priority: 50, elements }).then(done, (err) => {
       report(err);
+      // The back was not updated: send it again with the next frame.
+      if (withBack) backDirty = true;
       done();
     });
   };
 
   const save = () => {
+    if (saveTimer !== undefined) clearTimeout(saveTimer);
+    saveTimer = undefined;
+    unsaved = false;
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify({ key, prog }));
     } catch (err) {
@@ -139,57 +166,59 @@ function main(): void {
     }
   };
 
-  /** Flash is rewritten on every save, so only once the choice has settled. */
-  const scheduleSave = () => {
+  /**
+   * Flash is rewritten on every save, so it waits until a choice made with the
+   * controls has settled. Key changes made by the beat are saved on pause or exit.
+   */
+  const changed = (byControl: boolean) => {
+    unsaved = true;
+    if (!byControl) return;
     if (saveTimer !== undefined) clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => {
-      saveTimer = undefined;
-      save();
-    }, SAVE_DELAY_MS);
+    saveTimer = setTimeout(save, SAVE_DELAY_MS);
   };
 
-  /** Shows the key's name on the front for a moment, where the next chord goes. */
+  /** Shows the key's name on the front for a moment, where the next chord goes; while playing, for one chord at most. */
   const showKey = () => {
     flashKey = true;
     if (flashTimer !== undefined) clearTimeout(flashTimer);
+    const duration = playing ? Math.min(KEY_FLASH_MS, config.beats * beatMs()) : KEY_FLASH_MS;
     flashTimer = setTimeout(() => {
       flashTimer = undefined;
       flashKey = false;
       requestDraw(false);
-    }, KEY_FLASH_MS);
+    }, duration);
   };
 
-  const advance = () => {
+  const advance = (byControl: boolean) => {
     const np = nextPosition();
     if (np.key !== key) {
       showKey();
-      scheduleSave();
+      changed(byControl);
     }
     key = np.key;
     step = np.step;
   };
 
-  const clock = beatClock(
-    () => 60000 / config.tempo,
-    (b) => {
-      if (b < countInBeats) {
-        countIn = countInBeats - b;
-        beat = 0;
-        requestDraw(b === 0);
-        return;
-      }
-      const pos = b - countInBeats;
-      const changes = pos > 0 && pos % config.beats === 0;
-      if (changes) advance();
-      countIn = 0;
-      beat = pos % config.beats;
-      requestDraw(changes || pos === 0);
-    },
-  );
+  const clock = beatClock(beatMs, (b) => {
+    if (b < countInBeats) {
+      countIn = countInBeats - b;
+      beat = 0;
+      requestDraw(b === 0);
+      return;
+    }
+    const pos = b - countInBeats;
+    const chord = Math.floor(pos / config.beats);
+    const changes = Math.min(chord - chordsPlayed, MAX_CATCH_UP);
+    for (let i = 0; i < changes; i++) advance(false);
+    chordsPlayed = chord;
+    countIn = 0;
+    beat = pos % config.beats;
+    requestDraw(changes > 0 || pos === 0);
+  });
 
-  /** Restarts the beat on the current chord, without count-in: after a manual change while playing. */
-  const restartBeat = () => {
-    countInBeats = 0;
+  const startBeat = (withCountIn: boolean) => {
+    countInBeats = withCountIn ? COUNT_IN : 0;
+    chordsPlayed = 0;
     clock.start();
   };
 
@@ -198,11 +227,7 @@ function main(): void {
     clock.stop();
     if (flashTimer !== undefined) clearTimeout(flashTimer);
     flashTimer = undefined;
-    if (saveTimer !== undefined) {
-      clearTimeout(saveTimer);
-      saveTimer = undefined;
-      save();
-    }
+    if (unsaved) save();
   };
 
   // One request at a time at launch: settings, then the keyboard, then the first frame.
@@ -215,17 +240,19 @@ function main(): void {
     } catch (err) {
       report(err);
     }
+    ready = true;
     requestDraw(true);
   };
   startUp().catch(report);
 
   const unbind = listen("input", (event) => {
     if (stopped) return;
+    if (!ready && event.key !== "back") return;
 
     if (event.key === "encoder") {
       key = (key + (event.delta > 0 ? 1 : 11)) % 12;
       showKey();
-      scheduleSave();
+      changed(true);
       requestDraw(true);
       return;
     }
@@ -233,8 +260,8 @@ function main(): void {
     if (event.key === "ok" && event.action === "long") {
       prog = (prog + 1) % PROGRESSIONS.length;
       step = 0;
-      scheduleSave();
-      if (playing) restartBeat();
+      changed(true);
+      if (playing) startBeat(false);
       else requestDraw(true);
       return;
     }
@@ -243,17 +270,17 @@ function main(): void {
     if (event.key === "start") {
       playing = !playing;
       if (playing) {
-        countInBeats = COUNT_IN;
-        clock.start();
+        startBeat(true);
       } else {
         clock.stop();
         countIn = 0;
         beat = 0;
+        if (unsaved) save();
         requestDraw(true);
       }
     } else if (event.key === "ok") {
-      advance();
-      if (playing) restartBeat();
+      advance(true);
+      if (playing) startBeat(false);
       else requestDraw(true);
     } else if (event.key === "back") {
       quit();
